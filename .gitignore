@@ -1,0 +1,13 @@
+# Environment files
+.env
+*.env
+# Service account
+serviceAccount.json
+# Node modules
+node_modules/
+# OS
+.DS_Store
+Thumbs.db
+# IDE
+.vscode/
+.idea/

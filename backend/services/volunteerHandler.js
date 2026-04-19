@@ -1,169 +1,83 @@
-const { db, getVolunteer, updateTaskStatus, admin } = require('./firebaseService');
+const { db } = require('./firebaseService');
 const { sendMessage } = require('./telegramService');
 
-/**
- * Handle YES response from volunteer
- */
-async function handleYes(volunteerId) {
+async function handleYes(userId) {
   try {
-    const volunteer = await getVolunteer(volunteerId);
+    const uId = String(userId); // Ensure string format
     
-    if (!volunteer) {
-      await sendMessage(volunteerId, '❌ You\'re not registered as a volunteer.');
-      return;
-    }
-    
-    // Find tasks dispatched to this volunteer that are still unassigned
-    const tasksSnapshot = await db
-      .collection('tasks')
-      .where('status', '==', 'dispatched')
-      .where('dispatchedTo', 'array-contains', String(volunteerId))
-      .orderBy('createdAt', 'desc')
-      .limit(1)
-      .get();
-    
-    if (tasksSnapshot.empty) {
-      await sendMessage(
-        volunteerId,
-        '⚠️ No pending tasks found.\n\n' +
-        'This task may have been assigned to someone else already.'
-      );
-      return;
-    }
-    
-    const taskDoc = tasksSnapshot.docs[0];
-    const task = taskDoc.data();
-    const taskId = taskDoc.id;
-    
-    // Assign task to this volunteer
-    await updateTaskStatus(taskId, 'assigned', {
-      assignedVolunteer: String(volunteerId),
-    });
-    
-    // Update volunteer's task count
-    await db
-      .collection('volunteers')
-      .doc(String(volunteerId))
-      .update({
-        currentTaskCount: admin.firestore.FieldValue.increment(1),
-        tasksAccepted: admin.firestore.FieldValue.increment(1),
-        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    
-    // Notify this volunteer
-    await sendMessage(
-      volunteerId,
-      `✅ *Task assigned to you!*\n\n` +
-      `📋 ${task.description}\n` +
-      `📍 ${task.location}\n\n` +
-      `When completed, reply: *DONE*`
-    );
-    
-    // Notify other volunteers who were dispatched
-    const otherVolunteers = task.dispatchedTo.filter((id) => id !== String(volunteerId));
-    for (const otherId of otherVolunteers) {
-      await sendMessage(
-        otherId,
-        `ℹ️ Task at ${task.location} has been assigned to another volunteer.`
-      );
-    }
-    
-    console.log(`✅ Task ${taskId} assigned to ${volunteer.name}`);
-  } catch (error) {
-    console.error('❌ Error handling YES:', error);
-    await sendMessage(volunteerId, '❌ Error assigning task. Please try again.');
-  }
-}
-
-/**
- * Handle NO response from volunteer
- */
-async function handleNo(volunteerId) {
-  try {
-    await sendMessage(
-      volunteerId,
-      '👍 No problem! You won\'t be assigned this task.\n\n' +
-      'You\'ll receive new opportunities soon.'
-    );
-    
-    // Update last active time
-    await db
-      .collection('volunteers')
-      .doc(String(volunteerId))
-      .update({
-        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-    
-    console.log(`📝 Volunteer ${volunteerId} declined task`);
-  } catch (error) {
-    console.error('❌ Error handling NO:', error);
-  }
-}
-
-/**
- * Handle DONE response from volunteer
- */
-async function handleDone(userId) {
-  try {
-    console.log(`Checking task for user: ${userId}`);
-    
-    // 1. Task dhoondne ke liye query (userId ko String mein convert karke)
+    // 1. Find latest dispatched task
     const taskSnapshot = await db.collection('tasks')
-      .where('status', '==', 'assigned')
-      .where('assignedTo', '==', String(userId))
+      .where('status', '==', 'dispatched')
+      .where('dispatchedTo', 'array-contains', uId)
+      .orderBy('createdAt', 'desc')
       .limit(1)
       .get();
 
     if (taskSnapshot.empty) {
-      console.log(`No assigned task found for ${userId}`);
-      return await sendMessage(userId, "❓ You don't have any active tasks to complete.");
+      return await sendMessage(uId, "❌ No active pending tasks found for you.");
     }
 
     const taskDoc = taskSnapshot.docs[0];
-    const taskData = taskDoc.data();
+    
+    // 2. Assign with STRICT ID matching
+    await taskDoc.ref.update({
+      status: 'assigned',
+      assignedTo: uId, // Yahan string save ho raha hai
+      assignedAt: new Date().toISOString()
+    });
 
-    // 2. Task status ko 'completed' mark karein
+    await sendMessage(uId, `✅ *Task assigned to you!*\n\n📍 Location: ${taskDoc.data().location}\n\nWhen completed, reply: *DONE*`);
+
+  } catch (error) {
+    console.error('Error in handleYes:', error);
+    await sendMessage(userId, "❌ Error assigning task.");
+  }
+}
+
+async function handleDone(userId) {
+  try {
+    const uId = String(userId);
+    console.log(`Checking DONE for UserID: ${uId}`);
+
+    // 1. Search for task assigned to this EXACT string ID
+    const taskSnapshot = await db.collection('tasks')
+      .where('status', '==', 'assigned')
+      .where('assignedTo', '==', uId)
+      .limit(1)
+      .get();
+
+    if (taskSnapshot.empty) {
+      return await sendMessage(uId, "❓ You don't have any active tasks to complete.");
+    }
+
+    const taskDoc = taskSnapshot.docs[0];
+
+    // 2. Mark Completed
     await taskDoc.ref.update({
       status: 'completed',
       completedAt: new Date().toISOString()
     });
 
-    // 3. Volunteer ki availability aur stats update karein
-    const volRef = db.collection('volunteers').doc(String(userId));
+    // 3. Update Volunteer Stats in DB
+    const volRef = db.collection('volunteers').doc(uId);
     const volDoc = await volRef.get();
-    
-    let totalCompleted = 1;
+    let count = 1;
 
     if (volDoc.exists) {
-      const currentStats = volDoc.data();
-      totalCompleted = (currentStats.completedTasks || 0) + 1;
-      
+      count = (volDoc.data().completedTasks || 0) + 1;
       await volRef.update({
-        completedTasks: totalCompleted,
-        currentTaskCount: 0, // Task khatam, load zero
-        isAvailable: true    // Ab volunteer phir se free hai
+        completedTasks: count,
+        currentTaskCount: 0,
+        isAvailable: true
       });
     }
 
-    // 4. Success Message with Stats
-    const message = 
-      `🎉 *Task completed!*\n\n` +
-      `Great work on:\n${taskData.rawInput || 'Emergency Report'}\n\n` +
-      `📊 *Your stats*:\n` +
-      `✅ Total Completed: ${totalCompleted}\n` +
-      `📈 Success rate: 100%`;
-
-    await sendMessage(userId, message);
-    console.log(`✅ Task ${taskDoc.id} marked DONE by ${userId}`);
+    await sendMessage(uId, `🎉 *Task completed!*\n\n📊 *Your stats*:\n✅ Completed: ${count}\n📈 Success rate: 100%`);
 
   } catch (error) {
-    console.error('❌ Error in handleDone:', error);
-    await sendMessage(userId, "❌ Error completing task. Please try again.");
+    console.error('Error in handleDone:', error);
+    await sendMessage(userId, "❌ Error completing task.");
   }
 }
 
-module.exports = {
-  handleYes,
-  handleNo,
-  handleDone,
-};
+module.exports = { handleYes, handleNo: (id) => sendMessage(id, "OK."), handleDone };

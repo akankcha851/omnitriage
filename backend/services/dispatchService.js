@@ -1,5 +1,6 @@
-const { getAvailableVolunteers, updateTaskStatus, admin } = require('./firebaseService');
+const { updateTaskStatus } = require('./firebaseService');
 const { sendMessage } = require('./telegramService');
+const { db } = require('./firebaseService'); // Directly importing db for flexibility
 
 /**
  * Calculate match score for volunteer
@@ -7,153 +8,124 @@ const { sendMessage } = require('./telegramService');
 function calculateMatchScore(volunteer, task) {
   let score = 0;
   
-  // SAFETY FIX: Ensure requiredSkills is an array
-  const requiredSkills = Array.isArray(task.requiredSkills) 
-    ? task.requiredSkills 
-    : [task.requiredSkills];
+  // Safety Fix: Ensure requiredSkills is handled safely
+  const taskSkills = Array.isArray(task.requiredSkills) ? task.requiredSkills : [task.requiredSkills || 'general'];
+  const volunteerSkills = Array.isArray(volunteer.skills) ? volunteer.skills : [];
 
-  // Skill match (most important)
-  const skillMatches = requiredSkills.filter((skill) =>
-    (volunteer.skills || []).includes(skill)
-  ).length;
-  
+  // Basic skill match
+  const skillMatches = taskSkills.filter(skill => volunteerSkills.includes(skill)).length;
   score += skillMatches * 10;
   
-  // Success rate bonus
-  score += (volunteer.successRate || 0) * 5;
-  
-  // Availability (current load)
-  const loadFactor = 1 - (volunteer.currentTaskCount || 0) / (volunteer.maxConcurrentTasks || 1);
-  score += loadFactor * 3;
-  
-  // Urgency multiplier
-  const urgency = parseInt(task.urgency) || 1;
-  if (urgency >= 4 && skillMatches > 0) {
-    score *= 1.5;
-  }
+  // Load Factor (Prefer volunteers with fewer tasks)
+  const currentTasks = volunteer.currentTaskCount || 0;
+  score += (5 - currentTasks) * 2; 
   
   return score;
 }
 
 /**
- * Select top 3 volunteers for a task
+ * Select top volunteers
  */
 function selectVolunteers(task, allVolunteers) {
-  if (allVolunteers.length === 0) {
-    return [];
-  }
+  if (allVolunteers.length === 0) return [];
   
-  // Score and sort
   const scoredVolunteers = allVolunteers
-    .map((volunteer) => ({
-      ...volunteer,
-      matchScore: calculateMatchScore(volunteer, task),
-    }))
+    .map(v => ({ ...v, matchScore: calculateMatchScore(v, task) }))
     .sort((a, b) => b.matchScore - a.matchScore);
   
-  // Top 3
   const selected = scoredVolunteers.slice(0, 3);
-  
-  console.log(`✅ Selected ${selected.length} volunteers`);
-  console.log('Top matches:', selected.map((v) => `${v.name} (${v.matchScore.toFixed(1)})`));
-  
+  console.log(`✅ Selected ${selected.length} volunteers for dispatch`);
   return selected;
 }
 
 /**
- * Notify volunteers
+ * Notify volunteers via Telegram
  */
 async function notifyVolunteers(volunteers, task) {
-  const notifications = [];
+  const notifiedIds = [];
   
   for (const volunteer of volunteers) {
     try {
-      const urgencyEmoji = task.urgency >= 4 ? '🚨' : task.urgency >= 3 ? '⚠️' : '📋';
-      const message =
-        `${urgencyEmoji} *NEW TASK AVAILABLE*\n\n` +
-        `📋 *Type*: ${task.issueType.toUpperCase()}\n` +
-        `📍 *Location*: ${task.location}\n` +
-        `👥 *People*: ${task.estimatedPeople}\n` +
-        `🚨 *Urgency*: ${task.urgency}/5\n\n` +
-        `📝 *Description*:\n${task.description}\n\n` +
-        // notifyVolunteers function ke andar ye line dhundiye aur replace kijiye:
-`⏱️ *Skills needed*: ${(Array.isArray(task.requiredSkills) ? task.requiredSkills : [task.requiredSkills]).join(', ') || 'general'}\n\n`  +
+      // Logic: Use telegramId if exists, otherwise fallback to document ID
+      const targetChatId = volunteer.telegramId || volunteer.id;
+      
+      const urgencyEmoji = task.urgency >= 4 ? '🚨' : '📋';
+      const message = 
+        `${urgencyEmoji} *NEW EMERGENCY TASK*\n\n` +
+        `📍 *Location*: ${task.location || 'Unknown'}\n` +
+        `📋 *Issue*: ${task.issueType?.toUpperCase() || 'General'}\n` +
+        `🚨 *Urgency*: ${task.urgency}/5\n` +
+        `📝 *Details*: ${task.rawInput || 'No description provided'}\n\n` +
         `━━━━━━━━━━━━━━━━\n` +
-        `Reply:\n` +
-        `✅ *YES* - I'll take this\n` +
-        `❌ *NO* - Can't help`;
-      
-      await sendMessage(volunteer.id, message);
-      notifications.push(volunteer.id);
-      
-      console.log(`✅ Notified ${volunteer.name}`);
+        `Do you want to accept this task?\n` +
+        `Reply: *YES* or *NO*`;
+
+      await sendMessage(targetChatId, message);
+      notifiedIds.push(volunteer.id);
+      console.log(`✅ Dispatch notification sent to: ${volunteer.name || targetChatId}`);
     } catch (error) {
-      console.error(`❌ Failed to notify ${volunteer.name}:`, error);
+      console.error(`❌ Failed to notify volunteer ${volunteer.id}:`, error.message);
     }
   }
-  
-  return notifications;
+  return notifiedIds;
 }
 
 /**
- * Main dispatch function
+ * Main Dispatch Function
  */
 async function dispatchTask(taskId, taskData = null) {
   try {
-    console.log(`🚀 Dispatching task: ${taskId}`);
+    console.log(`🚀 Starting dispatch process for task: ${taskId}`);
     
-    // Get task if not provided
+    // 1. Get Task Data
     let task = taskData;
     if (!task) {
-      const { db } = require('./firebaseService');
-      const taskDoc = await db.collection('tasks').doc(taskId).get();
-      
-      if (!taskDoc.exists) {
-        throw new Error('Task not found');
-      }
-      
-      task = { id: taskDoc.id, ...taskDoc.data() };
+      const doc = await db.collection('tasks').doc(taskId).get();
+      if (!doc.exists) throw new Error('Task not found in DB');
+      task = { id: doc.id, ...doc.data() };
     }
-    
-    // Don't dispatch if already dispatched/assigned
+
+    // 2. Security Check
     if (task.status !== 'open') {
-      console.log(`⚠️ Task ${taskId} already ${task.status}`);
-      return { success: false, reason: 'Already dispatched' };
+      console.log(`⚠️ Task ${taskId} is already ${task.status}. Skipping.`);
+      return { success: false, reason: 'Task not open' };
     }
-    
-    // Get available volunteers
-    const allVolunteers = await getAvailableVolunteers(task.requiredSkills);
-    
+
+    // 3. Get Available Volunteers (SIMPLIFIED QUERY)
+    // Testing ke liye hum sirf 'isAvailable' check kar rahe hain
+    const volSnapshot = await db.collection('volunteers')
+      .where('isAvailable', '==', true)
+      .get();
+
+    let allVolunteers = volSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+    // 4. Log for Debugging
+    console.log(`🔍 Found ${allVolunteers.length} available volunteers in DB`);
+
     if (allVolunteers.length === 0) {
-      console.log('⚠️ No volunteers available');
+      console.log('⚠️ No available volunteers found in Database.');
       return { success: false, reason: 'No volunteers' };
     }
-    
-    // Select top 3
+
+    // 5. Filter & Notify
     const selectedVolunteers = selectVolunteers(task, allVolunteers);
-    
-    // Notify volunteers
     const notifiedIds = await notifyVolunteers(selectedVolunteers, task);
-    
-    // Update task status
-    await updateTaskStatus(taskId, 'dispatched', {
-      dispatchedTo: notifiedIds,
-    });
-    
-    console.log(`✅ Task ${taskId} dispatched to ${notifiedIds.length} volunteers`);
-    
-    return {
-      success: true,
-      volunteersNotified: notifiedIds.length,
-    };
+
+    // 6. Update Status to 'dispatched'
+    if (notifiedIds.length > 0) {
+      await updateTaskStatus(taskId, 'dispatched', {
+        dispatchedTo: notifiedIds,
+        dispatchedAt: new Date().toISOString()
+      });
+      console.log(`🏁 Dispatch complete for ${taskId}`);
+    }
+
+    return { success: true, notifiedCount: notifiedIds.length };
+
   } catch (error) {
-    console.error('❌ Dispatch error:', error);
-    throw error;
+    console.error('❌ Critical Dispatch Error:', error);
+    return { success: false, error: error.message };
   }
 }
 
-module.exports = {
-  dispatchTask,
-  selectVolunteers,
-  calculateMatchScore,
-};
+module.exports = { dispatchTask };

@@ -52,6 +52,11 @@ app.post('/dispatch', async (req, res) => {
  * Telegram Webhook
  * Processes incoming reports from field workers
  */
+// Import volunteer handlers at top
+// Import volunteer handlers at top
+const { handleYes, handleNo, handleDone } = require('./services/volunteerHandler');
+
+// Update the /webhook route
 app.post('/webhook', async (req, res) => {
   try {
     const message = req.body.message;
@@ -79,15 +84,21 @@ app.post('/webhook', async (req, res) => {
       return res.sendStatus(200);
     }
     
-    // Handle simple volunteer responses
+    // Handle volunteer responses
     const upperText = text.toUpperCase().trim();
+    
     if (upperText === 'YES' || upperText === 'Y') {
-      await sendMessage(chatId, '✅ Received! Looking for assignments...');
+      await handleYes(userId);
       return res.sendStatus(200);
     }
     
     if (upperText === 'NO' || upperText === 'N') {
-      await sendMessage(chatId, '👍 No problem!');
+      await handleNo(userId);
+      return res.sendStatus(200);
+    }
+    
+    if (upperText === 'DONE' || upperText === 'D') {
+      await handleDone(userId);
       return res.sendStatus(200);
     }
     
@@ -95,7 +106,7 @@ app.post('/webhook', async (req, res) => {
     if (text && text.length > 0) {
       await sendMessage(chatId, '📝 Processing your report...');
       
-      // Extract data using Gemini AI
+      // Extract with Gemini
       const extracted = await extractFromText(text);
       
       // Create task in Firestore
@@ -108,16 +119,15 @@ app.post('/webhook', async (req, res) => {
         reporterName: userName,
         hasImage: false,
         imageUrl: '',
-        status: 'open', // Explicitly set as open for poller
       };
       
       const task = await createTask(taskData);
       
-      // Send confirmation back to reporter
+      // Send confirmation
       const confidenceEmoji = extracted.confidence >= 0.8 ? '✅' : '⚠️';
       const reviewNote = extracted.confidence < 0.7
         ? '\n\n⚠️ *Low confidence - will be reviewed by coordinator*'
-        : '\n\n🚀 *High confidence - auto-dispatching to volunteers!*';
+        : '';
       
       await sendMessage(
         chatId,
@@ -130,7 +140,7 @@ app.post('/webhook', async (req, res) => {
         reviewNote
       );
       
-      console.log(`✅ Task ${task.id} created successfully`);
+      console.log(`✅ Task ${task.id} created`);
     }
     
     res.sendStatus(200);

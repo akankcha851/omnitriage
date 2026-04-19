@@ -44,27 +44,39 @@ async function createTask(taskData) {
 /**
  * Get available volunteers
  */
+/**
+ * Get available volunteers (REPLACED WITH SMART MATCH)
+ */
 async function getAvailableVolunteers(requiredSkills = []) {
   try {
+    // 1. Pehle ye safety line add karein:
+    // Agar requiredSkills array nahi hai, toh use array mein convert kar do
+    const skillsArray = Array.isArray(requiredSkills) ? requiredSkills : [requiredSkills];
+
     const snapshot = await db.collection('volunteers')
       .where('isAvailable', '==', true)
-      .where('currentTaskCount', '<', 2)
+      .where('currentTaskCount', '<', 5)
       .get();
     
     if (snapshot.empty) {
-      console.log('⚠️ No available volunteers');
+      console.log('⚠️ No volunteers available in DB');
       return [];
     }
     
     const volunteers = [];
+    
+    // 2. Ab 'skillsArray' use karein (requiredSkills ki jagah)
+    const normalizedRequired = skillsArray.map(s => String(s).toLowerCase());
+
     snapshot.forEach((doc) => {
       const volunteer = { id: doc.id, ...doc.data() };
-      
-      // Filter by skill match if skills required
-      if (requiredSkills.length > 0) {
-        const hasSkill = requiredSkills.some((skill) =>
-          volunteer.skills.includes(skill)
+      const volunteerSkills = (volunteer.skills || []).map(s => String(s).toLowerCase());
+
+      if (normalizedRequired.length > 0) {
+        const hasSkill = normalizedRequired.some((reqSkill) => 
+          volunteerSkills.some(volSkill => volSkill.includes(reqSkill) || reqSkill.includes(volSkill))
         );
+        
         if (hasSkill) {
           volunteers.push(volunteer);
         }
@@ -80,7 +92,6 @@ async function getAvailableVolunteers(requiredSkills = []) {
     return [];
   }
 }
-
 /**
  * Update task status
  */
